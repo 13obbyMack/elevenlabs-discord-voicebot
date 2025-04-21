@@ -30,9 +30,10 @@ A Discord bot that enables natural, real-time voice interactions in your server 
 2. Rename `.env.example` to `.env` and start filling in the values as detailed below:
 
    ```
-   DISCORD_TOKEN = x
+   DISCORD_BOT_TOKEN = x
    DISCORD_CLIENT_ID = x
    AGENT_ID = x
+   ELEVENLABS_API_KEY = x
    ```
 
 3. Create your own Discord application at https://discord.com/developers/applications.

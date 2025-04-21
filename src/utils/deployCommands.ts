@@ -21,7 +21,10 @@ export async function deployCommands(): Promise<void> {
     for (const file of readdirSync(commandsPath)) {
       if (!file.endsWith('.js')) continue;
 
-      const command = await import(`${commandsPath}/${file}`);
+      const commandPath = path.join(commandsPath, file);
+      // Convert the path to a proper file:// URL that works on Windows
+      const fileUrl = `file://${commandPath.replace(/\\/g, '/').replace(/^([a-zA-Z]):\/?/, '/$1:/')}`;
+      const command = await import(fileUrl);
 
       if (!('data' in command) || !('execute' in command)) {
         logger.info(`The command at ${file} is missing a required "data" or "execute" property.`);

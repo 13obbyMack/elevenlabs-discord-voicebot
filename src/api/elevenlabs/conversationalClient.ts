@@ -37,7 +37,18 @@ export class ElevenLabsConversationalAI {
   public async connect(): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       logger.info('Establishing connection to ElevenLabs Conversational WebSocket...');
-      this.socket = new WebSocket(this.url);
+      logger.info(`Using API key: ${ELEVENLABS_CONFIG.API_KEY ? 'API key is set' : 'API key is NOT set'}`);
+      
+      // For debugging purposes only - check if we're getting the API key from env
+      if (!ELEVENLABS_CONFIG.API_KEY) {
+        logger.error('ELEVENLABS_API_KEY is not set in environment variables');
+      }
+      
+      this.socket = new WebSocket(this.url, {
+        headers: {
+          'xi-api-key': ELEVENLABS_CONFIG.API_KEY
+        }
+      });
 
       this.socket.on('open', () => {
         logger.info('Successfully connected to ElevenLabs Conversational WebSocket.');

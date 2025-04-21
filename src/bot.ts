@@ -32,7 +32,10 @@ class Bot extends Client {
   async loadCommands(): Promise<void> {
     const commandsPath = path.join(__dirname, 'commands');
     for (const file of readdirSync(commandsPath).filter(f => f.endsWith('.js'))) {
-      const command = await import(`file://${path.join(commandsPath, file)}`);
+      const commandPath = path.join(commandsPath, file);
+      // Convert the path to a proper file:// URL that works on Windows
+      const fileUrl = `file://${commandPath.replace(/\\/g, '/').replace(/^([a-zA-Z]):\/?/, '/$1:/')}`;
+      const command = await import(fileUrl);
       if ('data' in command && 'execute' in command) {
         this.commands.set(command.data.name, command);
         logger.info(`Loaded command ${command.data.name}`);

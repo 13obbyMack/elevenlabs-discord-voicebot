@@ -15,4 +15,5 @@ export const DISCORD_CONFIG = {
 
 export const ELEVENLABS_CONFIG = {
   AGENT_ID: loadEnv('AGENT_ID'),
+  API_KEY: loadEnv('ELEVENLABS_API_KEY'),
 };
