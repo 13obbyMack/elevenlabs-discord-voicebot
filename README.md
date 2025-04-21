@@ -32,7 +32,6 @@ A Discord bot that enables natural, real-time voice interactions in your server 
    ```
    DISCORD_TOKEN = x
    DISCORD_CLIENT_ID = x
-
    AGENT_ID = x
    ```
 
