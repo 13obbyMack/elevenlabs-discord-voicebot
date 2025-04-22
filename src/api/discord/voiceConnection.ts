@@ -2,7 +2,6 @@ import { getVoiceConnection, joinVoiceChannel, VoiceConnection } from '@discordj
 import { CommandInteraction, GuildMember } from 'discord.js';
 import { logger } from '../../config/index.js';
 import { Embeds } from '../../utils/index.js';
-import { ElevenLabsConversationalAI } from '../elevenlabs/conversationalClient.js';
 
 /**
  * Manages voice connections for a Discord bot, handling connection and disconnection from voice channels.
@@ -45,6 +44,7 @@ class VoiceConnectionHandler {
       }
 
       const member = this.interaction.member as GuildMember;
+      logger.info(`Attempting to join voice channel: ${member.voice.channel!.id}`);
 
       const connection = joinVoiceChannel({
         channelId: member.voice.channel!.id,
@@ -52,6 +52,22 @@ class VoiceConnectionHandler {
         adapterCreator: member.guild.voiceAdapterCreator,
         selfDeaf: false,
         selfMute: false,
+      });
+      
+      // Add connection state change logging
+      connection.on('stateChange', (oldState, newState) => {
+        logger.info(`Voice connection state changed from ${oldState.status} to ${newState.status}`);
+        
+        if (newState.status === 'ready') {
+          logger.info('Voice connection is ready for audio transmission');
+        } else if (newState.status === 'disconnected') {
+          logger.info('Voice connection disconnected');
+        }
+      });
+      
+      // Handle errors
+      connection.on('error', (error) => {
+        logger.error('Voice connection error:', error);
       });
 
       await this.interaction.reply({

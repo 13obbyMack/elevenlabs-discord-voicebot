@@ -24,6 +24,18 @@ export class ElevenLabsConversationalAI {
   constructor(audioPlayer: AudioPlayer) {
     this.url = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${ELEVENLABS_CONFIG.AGENT_ID}`;
     this.audioPlayer = audioPlayer;
+    
+    // Add audio player state logging
+    this.audioPlayer.on('stateChange', (oldState, newState) => {
+      logger.info(`Audio player state changed from ${oldState.status} to ${newState.status}`);
+      
+      if (newState.status === 'playing') {
+        logger.info('Audio is now playing');
+      } else if (newState.status === 'idle') {
+        logger.info('Audio player is now idle');
+      }
+    });
+    
     this.socket = null;
     this.currentAudioStream = null;
     this.audioBufferQueue = [];
@@ -123,12 +135,21 @@ export class ElevenLabsConversationalAI {
    */
   private initializeAudioStream(): void {
     if (!this.currentAudioStream || this.currentAudioStream.destroyed) {
-      this.currentAudioStream = new PassThrough();
-      this.audioPlayer.play(
-        createAudioResource(this.currentAudioStream, {
-          inputType: StreamType.Raw,
-        })
-      );
+      logger.info('Initializing new audio stream for playback');
+      this.currentAudioStream = new PassThrough({ highWaterMark: 1024 * 512 });
+      
+      const resource = createAudioResource(this.currentAudioStream, {
+        inputType: StreamType.Raw,
+        inlineVolume: true
+      });
+      
+      // Set volume to maximum
+      if (resource.volume) {
+        resource.volume.setVolume(1.0);
+      }
+      
+      logger.info('Playing audio resource');
+      this.audioPlayer.play(resource);
     }
   }
 
@@ -141,13 +162,22 @@ export class ElevenLabsConversationalAI {
     if (this.isProcessing || this.audioBufferQueue.length === 0) return;
 
     this.isProcessing = true;
+    logger.info(`Processing audio queue with ${this.audioBufferQueue.length} buffers`);
 
     while (this.audioBufferQueue.length > 0) {
       const audioBuffer = this.audioBufferQueue.shift()!;
       try {
         this.initializeAudioStream();
+        logger.info(`Processing audio buffer of size ${audioBuffer.byteLength} bytes`);
         const pcmBuffer = await AudioUtils.mono441kHzToStereo48kHz(audioBuffer);
-        this.currentAudioStream?.write(pcmBuffer);
+        logger.info(`Converted to PCM buffer of size ${pcmBuffer.byteLength} bytes`);
+        
+        if (this.currentAudioStream && !this.currentAudioStream.destroyed) {
+          const writeSuccess = this.currentAudioStream.write(pcmBuffer);
+          logger.info(`Audio buffer write success: ${writeSuccess}`);
+        } else {
+          logger.error('Current audio stream is not available or destroyed');
+        }
       } catch (error) {
         logger.error('Error processing audio buffer:', error);
       }
@@ -162,9 +192,21 @@ export class ElevenLabsConversationalAI {
    * @returns {Promise<void>} A promise that resolves when the audio is processed.
    */
   private async handleAudio(message: AudioEvent): Promise<void> {
-    const audioBuffer = Buffer.from(message.audio_event.audio_base_64, 'base64');
-    this.audioBufferQueue.push(audioBuffer);
-    await this.processAudioQueue();
+    try {
+      logger.info(`Received audio event with ${message.audio_event.audio_base_64.length} base64 characters`);
+      const audioBuffer = Buffer.from(message.audio_event.audio_base_64, 'base64');
+      logger.info(`Decoded audio buffer size: ${audioBuffer.byteLength} bytes`);
+      
+      if (audioBuffer.byteLength === 0) {
+        logger.warn('Received empty audio buffer, skipping');
+        return;
+      }
+      
+      this.audioBufferQueue.push(audioBuffer);
+      await this.processAudioQueue();
+    } catch (error) {
+      logger.error('Error handling audio event:', error);
+    }
   }
 
   /**
