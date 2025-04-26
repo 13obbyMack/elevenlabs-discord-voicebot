@@ -136,7 +136,8 @@ export class ElevenLabsConversationalAI {
   private initializeAudioStream(): void {
     if (!this.currentAudioStream || this.currentAudioStream.destroyed) {
       logger.info('Initializing new audio stream for playback');
-      this.currentAudioStream = new PassThrough({ highWaterMark: 1024 * 512 });
+      // Increase the highWaterMark to handle larger audio chunks
+      this.currentAudioStream = new PassThrough({ highWaterMark: 1024 * 1024 }); // Increased from 512KB to 1MB
       
       const resource = createAudioResource(this.currentAudioStream, {
         inputType: StreamType.Raw,
@@ -164,8 +165,11 @@ export class ElevenLabsConversationalAI {
     this.isProcessing = true;
     logger.info(`Processing audio queue with ${this.audioBufferQueue.length} buffers`);
 
-    while (this.audioBufferQueue.length > 0) {
-      const audioBuffer = this.audioBufferQueue.shift()!;
+    // Process all buffers in the queue
+    const buffers = [...this.audioBufferQueue];
+    this.audioBufferQueue = [];
+    
+    for (const audioBuffer of buffers) {
       try {
         this.initializeAudioStream();
         logger.info(`Processing audio buffer of size ${audioBuffer.byteLength} bytes`);
@@ -173,13 +177,26 @@ export class ElevenLabsConversationalAI {
         logger.info(`Converted to PCM buffer of size ${pcmBuffer.byteLength} bytes`);
         
         if (this.currentAudioStream && !this.currentAudioStream.destroyed) {
-          const writeSuccess = this.currentAudioStream.write(pcmBuffer);
-          logger.info(`Audio buffer write success: ${writeSuccess}`);
+          // Implement backpressure handling
+          if (!this.currentAudioStream.write(pcmBuffer)) {
+            logger.info('Stream backpressure detected, waiting for drain event');
+            await new Promise<void>(resolve => {
+              this.currentAudioStream!.once('drain', () => {
+                logger.info('Stream drain event received, continuing processing');
+                resolve();
+              });
+            });
+          } else {
+            logger.info('Audio buffer write successful');
+          }
         } else {
           logger.error('Current audio stream is not available or destroyed');
+          // Reinitialize the stream if needed
+          this.initializeAudioStream();
         }
       } catch (error) {
         logger.error('Error processing audio buffer:', error);
+        // Continue processing other buffers even if one fails
       }
     }
 
@@ -202,8 +219,21 @@ export class ElevenLabsConversationalAI {
         return;
       }
       
-      this.audioBufferQueue.push(audioBuffer);
-      await this.processAudioQueue();
+      // For large buffers, chunk them to prevent overwhelming the audio stream
+      if (audioBuffer.byteLength > 100000) { // ~100KB threshold
+        const chunks = AudioUtils.chunkAudioBuffer(audioBuffer, 65536); // 64KB chunks
+        logger.info(`Split large audio buffer into ${chunks.length} chunks`);
+        
+        // Add chunks to queue in order
+        this.audioBufferQueue.push(...chunks);
+      } else {
+        this.audioBufferQueue.push(audioBuffer);
+      }
+      
+      // If we're not currently processing, start processing the queue
+      if (!this.isProcessing) {
+        await this.processAudioQueue();
+      }
     } catch (error) {
       logger.error('Error handling audio event:', error);
     }
