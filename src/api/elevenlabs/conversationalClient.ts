@@ -16,6 +16,11 @@ export class ElevenLabsConversationalAI {
   private currentAudioStream: PassThrough | null;
   private audioBufferQueue: Buffer[];
   private isProcessing: boolean;
+  private pendingAudioCompletion: boolean;
+  private audioEndTimeout: NodeJS.Timeout | null;
+  private keepAliveInterval: NodeJS.Timeout | null;
+  private reconnectAttempts: number;
+  private maxReconnectAttempts: number;
 
   /**
    * Creates an instance of ElevenLabsConversationalAI.
@@ -33,6 +38,17 @@ export class ElevenLabsConversationalAI {
         logger.info('Audio is now playing');
       } else if (newState.status === 'idle') {
         logger.info('Audio player is now idle');
+        // If we still have pending audio to process, reinitialize the stream
+        if (this.pendingAudioCompletion && (this.audioBufferQueue.length > 0 || this.isProcessing)) {
+          logger.info('Audio player went idle but we still have pending audio - reinitializing stream');
+          this.initializeAudioStream();
+        } else if (this.pendingAudioCompletion) {
+          // Set a timeout to ensure we've received all audio chunks before ending
+          this.audioEndTimeout = setTimeout(() => {
+            logger.info('Audio completion timeout reached, finalizing audio');
+            this.pendingAudioCompletion = false;
+          }, 2000); // 2 second grace period for any final chunks
+        }
       }
     });
     
@@ -40,6 +56,11 @@ export class ElevenLabsConversationalAI {
     this.currentAudioStream = null;
     this.audioBufferQueue = [];
     this.isProcessing = false;
+    this.pendingAudioCompletion = false;
+    this.audioEndTimeout = null;
+    this.keepAliveInterval = null;
+    this.reconnectAttempts = 0;
+    this.maxReconnectAttempts = 5;
   }
 
   /**
@@ -64,17 +85,42 @@ export class ElevenLabsConversationalAI {
 
       this.socket.on('open', () => {
         logger.info('Successfully connected to ElevenLabs Conversational WebSocket.');
+        
+        // Reset reconnect attempts on successful connection
+        this.reconnectAttempts = 0;
+        
+        // Start the keep-alive mechanism
+        this.startKeepAlive();
+        
         resolve();
       });
 
       this.socket.on('error', error => {
         logger.error(error, 'WebSocket encountered an error');
+        this.stopKeepAlive();
         reject(new Error(`Error during WebSocket connection: ${error.message}`));
       });
 
       this.socket.on('close', (code: number, reason: string) => {
         logger.info(`ElevenLabs WebSocket closed with code ${code}. Reason: ${reason}`);
-        this.cleanup();
+        this.stopKeepAlive();
+        
+        // Attempt to reconnect if the connection was closed unexpectedly
+        if (code !== 1000 && code !== 1001) { // 1000 = normal closure, 1001 = going away
+          this.attemptReconnect();
+        } else {
+          // Don't immediately clean up - wait for any pending audio to finish playing
+          if (this.pendingAudioCompletion) {
+            logger.info('WebSocket closed but audio is still pending - delaying cleanup');
+            // Set a timeout to allow any remaining audio to be processed
+            setTimeout(() => {
+              logger.info('Performing delayed cleanup after WebSocket close');
+              this.cleanup();
+            }, 5000); // 5 second delay to allow audio to finish
+          } else {
+            this.cleanup();
+          }
+        }
       });
 
       this.socket.on('message', message => this.handleEvent(message));
@@ -82,14 +128,60 @@ export class ElevenLabsConversationalAI {
   }
 
   /**
-   * Cleans up the current audio stream if it exists.
+   * Starts the WebSocket keep-alive mechanism.
    * @private
    */
-  private cleanup(): void {
-    if (this.currentAudioStream && !this.currentAudioStream.destroyed) {
-      this.currentAudioStream.push(null);
-      this.currentAudioStream.destroy();
-      this.currentAudioStream = null;
+  private startKeepAlive(): void {
+    // Clear any existing interval
+    this.stopKeepAlive();
+    
+    // Send a ping every 30 seconds to keep the connection alive
+    this.keepAliveInterval = setInterval(() => {
+      if (this.socket?.readyState === WebSocket.OPEN) {
+        logger.debug('Sending keep-alive ping');
+        
+        // Send an empty message as a ping to keep the connection alive
+        const pingMessage = { ping: true };
+        this.socket.send(JSON.stringify(pingMessage));
+      }
+    }, 30000); // 30 seconds
+    
+    logger.info('WebSocket keep-alive mechanism started');
+  }
+
+  /**
+   * Stops the WebSocket keep-alive mechanism.
+   * @private
+   */
+  private stopKeepAlive(): void {
+    if (this.keepAliveInterval) {
+      clearInterval(this.keepAliveInterval);
+      this.keepAliveInterval = null;
+      logger.info('WebSocket keep-alive mechanism stopped');
+    }
+  }
+
+  /**
+   * Attempts to reconnect to the WebSocket server.
+   * @private
+   */
+  private attemptReconnect(): void {
+    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+      this.reconnectAttempts++;
+      
+      // Exponential backoff: 2^n seconds (1, 2, 4, 8, 16 seconds)
+      const backoffTime = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), 30000);
+      
+      logger.info(`Attempting to reconnect in ${backoffTime/1000} seconds (attempt ${this.reconnectAttempts} of ${this.maxReconnectAttempts})`);
+      
+      setTimeout(() => {
+        logger.info('Attempting to reconnect to WebSocket...');
+        this.connect().catch(error => {
+          logger.error('Reconnection attempt failed:', error);
+        });
+      }, backoffTime);
+    } else {
+      logger.error(`Failed to reconnect after ${this.maxReconnectAttempts} attempts`);
     }
   }
 
@@ -98,8 +190,10 @@ export class ElevenLabsConversationalAI {
    * @returns {void}
    */
   public disconnect(): void {
+    this.stopKeepAlive();
+    
     if (this.socket?.readyState === WebSocket.OPEN) {
-      this.socket.close();
+      this.socket.close(1000, 'Client disconnected');
     }
     this.cleanup();
   }
@@ -131,13 +225,28 @@ export class ElevenLabsConversationalAI {
   /**
    * Initializes the audio stream for playback.
    * @private
-   * @returns {void}
+   * @returns {Promise<void>} A promise that resolves when the stream is ready
    */
-  private initializeAudioStream(): void {
+  private async initializeAudioStream(): Promise<void> {
     if (!this.currentAudioStream || this.currentAudioStream.destroyed) {
       logger.info('Initializing new audio stream for playback');
       // Increase the highWaterMark to handle larger audio chunks
-      this.currentAudioStream = new PassThrough({ highWaterMark: 1024 * 1024 }); // Increased from 512KB to 1MB
+      this.currentAudioStream = new PassThrough({ 
+        highWaterMark: 1024 * 1024 * 2,  // Increased to 2MB buffer
+        emitClose: false // Prevent premature close events
+      });
+      
+      // Add event listeners to the stream
+      this.currentAudioStream.on('close', () => {
+        logger.info('Audio stream closed');
+      });
+      
+      this.currentAudioStream.on('error', (err) => {
+        // Only log actual errors with messages
+        if (err && err.message) {
+          logger.error('Audio stream error:', err.message);
+        }
+      });
       
       const resource = createAudioResource(this.currentAudioStream, {
         inputType: StreamType.Raw,
@@ -151,6 +260,9 @@ export class ElevenLabsConversationalAI {
       
       logger.info('Playing audio resource');
       this.audioPlayer.play(resource);
+      
+      // Wait a short time for the player to initialize
+      await new Promise(resolve => setTimeout(resolve, 50));
     }
   }
 
@@ -165,42 +277,103 @@ export class ElevenLabsConversationalAI {
     this.isProcessing = true;
     logger.info(`Processing audio queue with ${this.audioBufferQueue.length} buffers`);
 
-    // Process all buffers in the queue
-    const buffers = [...this.audioBufferQueue];
-    this.audioBufferQueue = [];
-    
-    for (const audioBuffer of buffers) {
-      try {
-        this.initializeAudioStream();
-        logger.info(`Processing audio buffer of size ${audioBuffer.byteLength} bytes`);
-        const pcmBuffer = await AudioUtils.mono441kHzToStereo48kHz(audioBuffer);
-        logger.info(`Converted to PCM buffer of size ${pcmBuffer.byteLength} bytes`);
-        
-        if (this.currentAudioStream && !this.currentAudioStream.destroyed) {
-          // Implement backpressure handling
-          if (!this.currentAudioStream.write(pcmBuffer)) {
-            logger.info('Stream backpressure detected, waiting for drain event');
-            await new Promise<void>(resolve => {
-              this.currentAudioStream!.once('drain', () => {
-                logger.info('Stream drain event received, continuing processing');
-                resolve();
-              });
-            });
-          } else {
-            logger.info('Audio buffer write successful');
+    try {
+      // Process all buffers in the queue
+      const buffers = [...this.audioBufferQueue];
+      this.audioBufferQueue = [];
+      
+      // Make sure we have an audio stream ready
+      await this.initializeAudioStream();
+      
+      // Process each buffer sequentially
+      for (const audioBuffer of buffers) {
+        try {
+          if (!this.currentAudioStream || this.currentAudioStream.destroyed) {
+            logger.info('Audio stream was destroyed during processing, reinitializing');
+            await this.initializeAudioStream();
           }
-        } else {
-          logger.error('Current audio stream is not available or destroyed');
-          // Reinitialize the stream if needed
-          this.initializeAudioStream();
+          
+          logger.info(`Processing audio buffer of size ${audioBuffer.byteLength} bytes`);
+          const pcmBuffer = await AudioUtils.mono441kHzToStereo48kHz(audioBuffer);
+          logger.info(`Converted to PCM buffer of size ${pcmBuffer.byteLength} bytes`);
+          
+          if (pcmBuffer.byteLength === 0) {
+            logger.warn('Converted buffer is empty, skipping');
+            continue;
+          }
+          
+          // Double-check stream is still available before writing
+          if (!this.currentAudioStream || this.currentAudioStream.destroyed) {
+            logger.warn('Stream became unavailable after conversion, reinitializing');
+            await this.initializeAudioStream();
+          }
+          
+          if (this.currentAudioStream && !this.currentAudioStream.destroyed) {
+            // Implement backpressure handling
+            if (!this.currentAudioStream.write(pcmBuffer)) {
+              logger.info('Stream backpressure detected, waiting for drain event');
+              await new Promise<void>(resolve => {
+                const onDrain = () => {
+                  this.currentAudioStream?.removeListener('drain', onDrain);
+                  logger.info('Stream drain event received, continuing processing');
+                  resolve();
+                };
+                
+                this.currentAudioStream!.on('drain', onDrain);
+                
+                // Increased timeout for drain event
+                setTimeout(() => {
+                  this.currentAudioStream?.removeListener('drain', onDrain);
+                  logger.warn('Drain event timeout reached, continuing anyway');
+                  resolve();
+                }, 3000); // Increased from 1000ms to 3000ms
+              });
+            } else {
+              logger.info('Audio buffer write successful');
+            }
+          } else {
+            logger.error('Current audio stream is not available or destroyed');
+            // Reinitialize the stream if needed
+            await this.initializeAudioStream();
+            
+            // Try writing again after reinitialization
+            if (this.currentAudioStream) {
+              const writeSuccess = this.currentAudioStream.write(pcmBuffer);
+              logger.info(`Retry audio buffer write success: ${writeSuccess}`);
+            }
+          }
+          
+          // Increased delay between chunks to reduce backpressure
+          await new Promise(resolve => setTimeout(resolve, 30)); // Increased from 10ms to 30ms
+          
+        } catch (error) {
+          logger.error('Error processing audio buffer:', error);
+          // Continue processing other buffers even if one fails
         }
-      } catch (error) {
-        logger.error('Error processing audio buffer:', error);
-        // Continue processing other buffers even if one fails
       }
+      
+      // If we have more buffers that were added during processing, process them too
+      if (this.audioBufferQueue.length > 0) {
+        logger.info(`Additional ${this.audioBufferQueue.length} buffers were added during processing, continuing`);
+        this.isProcessing = false;
+        await this.processAudioQueue();
+        return;
+      }
+      
+      // Ensure the stream stays open for a short period after processing all buffers
+      // to catch any late-arriving chunks
+      if (this.currentAudioStream && !this.currentAudioStream.destroyed) {
+        logger.info('All audio buffers processed, keeping stream open for potential additional chunks');
+        
+        // Add a small amount of silence at the end to prevent abrupt cutoffs
+        const silenceBuffer = Buffer.alloc(4800); // 50ms of silence at 48kHz stereo
+        this.currentAudioStream.write(silenceBuffer);
+      }
+    } catch (error) {
+      logger.error('Error in processAudioQueue:', error);
+    } finally {
+      this.isProcessing = false;
     }
-
-    this.isProcessing = false;
   }
 
   /**
@@ -210,6 +383,15 @@ export class ElevenLabsConversationalAI {
    */
   private async handleAudio(message: AudioEvent): Promise<void> {
     try {
+      // Mark that we're expecting audio data
+      this.pendingAudioCompletion = true;
+      
+      // Clear any existing end timeout since we're receiving new audio
+      if (this.audioEndTimeout) {
+        clearTimeout(this.audioEndTimeout);
+        this.audioEndTimeout = null;
+      }
+      
       logger.info(`Received audio event with ${message.audio_event.audio_base_64.length} base64 characters`);
       const audioBuffer = Buffer.from(message.audio_event.audio_base_64, 'base64');
       logger.info(`Decoded audio buffer size: ${audioBuffer.byteLength} bytes`);
@@ -247,6 +429,12 @@ export class ElevenLabsConversationalAI {
   private handleEvent(message: WebSocket.RawData): void {
     const event = JSON.parse(message.toString());
 
+    // Ignore ping responses
+    if (event.pong === true) {
+      logger.debug('Received pong response');
+      return;
+    }
+
     switch (event.type) {
       case 'agent_response':
         this.handleAgentResponse(event);
@@ -270,6 +458,8 @@ export class ElevenLabsConversationalAI {
    */
   private handleAgentResponse(event: AgentResponseEvent): void {
     logger.info(event);
+    // Mark that we're expecting audio data to follow this response
+    this.pendingAudioCompletion = true;
   }
 
   /**
@@ -279,5 +469,50 @@ export class ElevenLabsConversationalAI {
    */
   private handleUserTranscript(event: UserTranscriptEvent): void {
     logger.info(event);
+  }
+
+  /**
+   * Cleans up the current audio stream if it exists.
+   * @private
+   */
+  private cleanup(): void {
+    // Clear any pending timeouts
+    if (this.audioEndTimeout) {
+      clearTimeout(this.audioEndTimeout);
+      this.audioEndTimeout = null;
+    }
+    
+    // Process any remaining audio in the queue before cleaning up
+    if (this.audioBufferQueue.length > 0 && !this.isProcessing) {
+      logger.info(`Processing ${this.audioBufferQueue.length} remaining buffers before cleanup`);
+      this.processAudioQueue().then(() => {
+        logger.info('Final audio processing complete, now cleaning up stream');
+        this.finalizeCleanup();
+      });
+    } else {
+      this.finalizeCleanup();
+    }
+  }
+  
+  /**
+   * Finalizes the cleanup by destroying the audio stream.
+   * @private
+   */
+  private finalizeCleanup(): void {
+    if (this.currentAudioStream && !this.currentAudioStream.destroyed) {
+      // Add a small delay before destroying to ensure all data is flushed
+      setTimeout(() => {
+        logger.info('Destroying audio stream');
+        if (this.currentAudioStream) {
+          this.currentAudioStream.push(null);
+          this.currentAudioStream.destroy();
+          this.currentAudioStream = null;
+        }
+      }, 500);
+    }
+    
+    // Reset state
+    this.pendingAudioCompletion = false;
+    this.audioBufferQueue = [];
   }
 }
