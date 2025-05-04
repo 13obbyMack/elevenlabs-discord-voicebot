@@ -1,6 +1,7 @@
 import opus from '@discordjs/opus';
 import { AudioReceiveStream, EndBehaviorType, VoiceConnection } from '@discordjs/voice';
 import { logger } from '../../config/index.js';
+import { AudioUtils } from '../../utils/index.js';
 import { ElevenLabsConversationalAI } from '../index.js';
 
 /**
@@ -89,6 +90,13 @@ class SpeechHandler {
   private processAudio(opusBuffer: Buffer): void {
     try {
       const pcmBuffer = this.decoder.decode(opusBuffer);
+      
+      // Skip processing if the buffer contains mostly silence
+      if (AudioUtils.isSilence(pcmBuffer)) {
+        logger.debug('Skipping silent audio buffer');
+        return;
+      }
+      
       this.client.appendInputAudio(pcmBuffer);
     } catch (error) {
       logger.error(error, 'Error processing audio for transcription');

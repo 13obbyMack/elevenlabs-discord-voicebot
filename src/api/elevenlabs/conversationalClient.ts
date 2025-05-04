@@ -80,6 +80,18 @@ export class ElevenLabsConversationalAI {
       this.socket = new WebSocket(this.url, {
         headers: {
           'xi-api-key': ELEVENLABS_CONFIG.API_KEY
+        },
+        perMessageDeflate: {
+          zlibDeflateOptions: {
+            level: 6, // Compression level (1-9, where 9 is highest but slowest)
+            memLevel: 8, // Memory allocation for compression (1-9, where 9 uses most memory)
+          },
+          zlibInflateOptions: {
+            chunkSize: 32 * 1024 // Chunk size for decompression
+          },
+          serverNoContextTakeover: false, // Allow server to maintain compression context
+          clientNoContextTakeover: false, // Allow client to maintain compression context
+          threshold: 512 // Only compress messages larger than this size in bytes
         }
       });
 
@@ -135,7 +147,7 @@ export class ElevenLabsConversationalAI {
     // Clear any existing interval
     this.stopKeepAlive();
     
-    // Send a ping every 30 seconds to keep the connection alive
+    // Send a ping every 15 seconds to keep the connection alive
     this.keepAliveInterval = setInterval(() => {
       if (this.socket?.readyState === WebSocket.OPEN) {
         logger.debug('Sending keep-alive ping');
@@ -144,7 +156,7 @@ export class ElevenLabsConversationalAI {
         const pingMessage = { ping: true };
         this.socket.send(JSON.stringify(pingMessage));
       }
-    }, 30000); // 30 seconds
+    }, 15000); // 15 seconds
     
     logger.info('WebSocket keep-alive mechanism started');
   }
@@ -169,8 +181,8 @@ export class ElevenLabsConversationalAI {
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
       
-      // Exponential backoff: 2^n seconds (1, 2, 4, 8, 16 seconds)
-      const backoffTime = Math.min(1000 * Math.pow(2, this.reconnectAttempts - 1), 30000);
+      // Modified backoff: faster initial reconnects (0.5, 1, 2, 4, 8 seconds)
+      const backoffTime = Math.min(500 * Math.pow(2, this.reconnectAttempts - 1), 30000);
       
       logger.info(`Attempting to reconnect in ${backoffTime/1000} seconds (attempt ${this.reconnectAttempts} of ${this.maxReconnectAttempts})`);
       
@@ -230,9 +242,9 @@ export class ElevenLabsConversationalAI {
   private async initializeAudioStream(): Promise<void> {
     if (!this.currentAudioStream || this.currentAudioStream.destroyed) {
       logger.info('Initializing new audio stream for playback');
-      // Increase the highWaterMark to handle larger audio chunks
+      // Reduce the highWaterMark to balance buffering and latency
       this.currentAudioStream = new PassThrough({ 
-        highWaterMark: 1024 * 1024 * 2,  // Increased to 2MB buffer
+        highWaterMark: 512 * 1024,  // Reduced from 2MB to 512KB buffer
         emitClose: false // Prevent premature close events
       });
       
@@ -261,8 +273,8 @@ export class ElevenLabsConversationalAI {
       logger.info('Playing audio resource');
       this.audioPlayer.play(resource);
       
-      // Wait a short time for the player to initialize
-      await new Promise(resolve => setTimeout(resolve, 50));
+      // Reduce wait time for player initialization
+      await new Promise(resolve => setTimeout(resolve, 20)); // Reduced from 50ms to 20ms
     }
   }
 
@@ -309,7 +321,7 @@ export class ElevenLabsConversationalAI {
           }
           
           if (this.currentAudioStream && !this.currentAudioStream.destroyed) {
-            // Implement backpressure handling
+            // Implement improved backpressure handling with adaptive timeout
             if (!this.currentAudioStream.write(pcmBuffer)) {
               logger.info('Stream backpressure detected, waiting for drain event');
               await new Promise<void>(resolve => {
@@ -321,12 +333,13 @@ export class ElevenLabsConversationalAI {
                 
                 this.currentAudioStream!.on('drain', onDrain);
                 
-                // Increased timeout for drain event
+                // Adaptive timeout based on buffer size
+                const timeoutMs = Math.min(Math.max(pcmBuffer.byteLength / 1024, 500), 2000);
                 setTimeout(() => {
                   this.currentAudioStream?.removeListener('drain', onDrain);
-                  logger.warn('Drain event timeout reached, continuing anyway');
+                  logger.warn(`Drain event timeout reached after ${timeoutMs}ms, continuing anyway`);
                   resolve();
-                }, 3000); // Increased from 1000ms to 3000ms
+                }, timeoutMs); // Adaptive timeout between 500ms and 2000ms
               });
             } else {
               logger.info('Audio buffer write successful');
@@ -343,8 +356,8 @@ export class ElevenLabsConversationalAI {
             }
           }
           
-          // Increased delay between chunks to reduce backpressure
-          await new Promise(resolve => setTimeout(resolve, 30)); // Increased from 10ms to 30ms
+          // Reduced delay between chunks to improve responsiveness
+          await new Promise(resolve => setTimeout(resolve, 15)); // Reduced from 30ms to 15ms
           
         } catch (error) {
           logger.error('Error processing audio buffer:', error);

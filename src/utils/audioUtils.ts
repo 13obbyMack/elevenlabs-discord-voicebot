@@ -90,6 +90,33 @@ class AudioUtils {
     logger.info(`Chunked audio buffer of size ${buffer.length} into ${chunks.length} chunks`);
     return chunks;
   }
+
+  /**
+   * Checks if an audio buffer contains mostly silence.
+   * @param {Buffer} buffer - The PCM audio buffer to check.
+   * @param {number} threshold - The amplitude threshold below which is considered silence (0-255).
+   * @param {number} silencePercentage - The percentage of samples that must be below threshold to consider as silence.
+   * @returns {boolean} True if the buffer is mostly silence, false otherwise.
+   */
+  static isSilence(buffer: Buffer, threshold: number = 5, silencePercentage: number = 0.95): boolean {
+    if (buffer.length === 0) return true;
+    
+    // Count samples below threshold
+    let silentSamples = 0;
+    const totalSamples = buffer.length;
+    
+    // Check every sample in the buffer
+    for (let i = 0; i < totalSamples; i++) {
+      if (Math.abs(buffer[i] - 128) <= threshold) {
+        silentSamples++;
+      }
+    }
+    
+    // Calculate percentage of silent samples
+    const silenceRatio = silentSamples / totalSamples;
+    
+    return silenceRatio >= silencePercentage;
+  }
 }
 
 export { AudioUtils };
